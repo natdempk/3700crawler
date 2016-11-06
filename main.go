@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"os"
 	"regexp"
+	"strconv"
+	"sync"
 	"time"
 )
 
@@ -14,36 +17,72 @@ import (
 // Request type, http version, user-agent, host, accept etc
 // cookies
 
-// Parse responses anyway
+// handle errors/redirects 301 (follow), 200, 403, 404, (abandon) 500 (retry)
 
-func main() {
+// globals
 
-	conn, _ := net.DialTimeout("tcp", "fring.ccs.neu.edu:80", time.Second)
+var csrfToken string
+var sessionCookie string
 
-	getReq := `GET /accounts/login/?next=/fakebook HTTP/1.1
+var visited map[string]bool = make(map[string]bool)
+var queue []string
+
+var visitedMutex = &sync.Mutex{}
+
+const numThreads = 20
+
+var semaphore = make(chan bool, numThreads)
+var flags = make(chan string, 5)
+
+func setVisited(i string) {
+	visitedMutex.Lock()
+	visited[i] = true
+	visitedMutex.Unlock()
+	return
+
+}
+
+func getConn() (conn net.Conn) {
+	conn, _ = net.Dial("tcp", "fring.ccs.neu.edu:80")
+	return
+}
+
+func responseCode(response string) (code int) {
+	stringCode := regexp.MustCompile("HTTP/1.1 ([0-9][0-9][0-9])")
+	code, _ = strconv.Atoi(stringCode.FindStringSubmatch(response)[1])
+	return
+}
+
+func get(path string) (response string) {
+	conn := getConn()
+
+	getReq := fmt.Sprintf(`GET %s HTTP/1.1
 User-Agent: curl/7.40.0
 Host: fring.ccs.neu.edu
-Content-Length: 0
+Cookie: csrftoken=%s; sessionid=%s
 Accept: */*
 
-`
-	fmt.Println(time.Now())
-	fmt.Fprint(conn, getReq)
-	readerB := bufio.NewReader(conn)
-	buf := make([]byte, 10000)
+`, path, csrfToken, sessionCookie)
 
-	fmt.Println(time.Now())
+	fmt.Fprintf(conn, getReq)
+
+	readerB := bufio.NewReader(conn)
+	buf := make([]byte, 1000000)
+
 	readerB.Read(buf)
-	resp := string(buf)
-	fmt.Println(resp)
+	response = string(buf)
 
 	conn.Close()
+	return
+}
 
-	fmt.Println(time.Now())
-	csrf := regexp.MustCompile("csrfmiddlewaretoken' value='([a-f0-9]*)'")
-	sessionCookie := regexp.MustCompile("Set-Cookie: sessionid=([a-f0-9]*)")
-	csrfToken := csrf.FindStringSubmatch(resp)[1]
-	sessCoo := sessionCookie.FindStringSubmatch(resp)[1]
+func login(username, password string) (csrf, session string) {
+	resp := get("/accounts/login/?next=/fakebook")
+
+	csrfRegex := regexp.MustCompile("csrfmiddlewaretoken' value='([a-f0-9]*)'")
+	sessionCookieRegex := regexp.MustCompile("Set-Cookie: sessionid=([a-f0-9]*)")
+	csrf = csrfRegex.FindStringSubmatch(resp)[1]
+	session = sessionCookieRegex.FindStringSubmatch(resp)[1]
 
 	// lol set content length
 	postReq := `POST /accounts/login/ HTTP/1.1
@@ -57,46 +96,95 @@ Content-Length: 109
 Referer: http://fring.ccs.neu.edu/accounts/login/?next=/fakebook/
 Cookie: csrftoken=%s; sessionid=%s
 
-username=001178291&password=418VQU32&csrfmiddlewaretoken=%s&next=%%2Ffakebook%%2F
+username=%s&password=%s&csrfmiddlewaretoken=%s&next=%%2Ffakebook%%2F
 
 `
 
-	fmt.Println(time.Now())
+	conn := getConn()
 
-	conn, _ = net.DialTimeout("tcp", "fring.ccs.neu.edu:80", time.Second)
+	fmt.Fprintf(conn, postReq, csrf, session, username, password, csrf)
 
-	fmt.Println(time.Now())
-	fmt.Fprintf(conn, postReq, csrfToken, sessCoo, csrfToken)
+	readerB := bufio.NewReader(conn)
+	buf := make([]byte, 1000000)
 
-	reader := bufio.NewScanner(conn)
-	resp = ""
+	readerB.Read(buf)
+	response := string(buf)
 
-	fmt.Println(time.Now())
-	for reader.Scan() {
-		resp += reader.Text() + "\n"
-	}
-
-	fmt.Println(time.Now())
-	sessCoo = sessionCookie.FindStringSubmatch(resp)[1]
+	session = sessionCookieRegex.FindStringSubmatch(response)[1]
 
 	conn.Close()
 
-	fmt.Println(time.Now())
-	getReq = `GET /fakebook/ HTTP/1.1
-User-Agent: curl/7.40.0
-Host: fring.ccs.neu.edu
-Cookie: csrftoken=%s; sessionid=%s
-Accept: */*
+	return
+}
 
-`
+func getLinks(response string) (links []string) {
+	linkRegex := regexp.MustCompile(`<a href="(.*?)">`)
+	matches := linkRegex.FindAllStringSubmatch(response, -1)
 
-	conn, _ = net.DialTimeout("tcp", "fring.ccs.neu.edu:80", time.Second)
-	fmt.Fprintf(conn, getReq, csrfToken, sessCoo)
-
-	reader = bufio.NewScanner(conn)
-	resp = ""
-	for reader.Scan() {
-		resp += reader.Text() + "\n"
+	for _, match := range matches {
+		links = append(links, match[1])
 	}
-	fmt.Println(resp)
+
+	return
+}
+
+func visitPageT(url string) {
+	_ = <-semaphore // beautiful
+	defer func() { semaphore <- true }()
+	//fmt.Printf("Visiting: %s\n", url)
+	resp := get(url)
+	rc := responseCode(resp)
+
+	switch rc {
+	case 301:
+		locationRegex := regexp.MustCompile(`Location: (.*)`)
+		location := locationRegex.FindStringSubmatch(resp)[1]
+		//queue = append(queue, location)
+		go visitPageT(location)
+		return
+	case 500:
+		go visitPageT(url)
+		return
+	}
+
+	flagRegex := regexp.MustCompile(`<h[1-6] class='secret_flag' style="color:red">FLAG: (.{64})</h[1-6]>`)
+	maybeFlag := flagRegex.FindAllStringSubmatch(resp, -1)
+	if len(maybeFlag) != 0 {
+		//fmt.Println("FOUND FLAG")
+		flag := maybeFlag[0][1]
+		flags <- flag
+		fmt.Println(flag)
+	}
+
+	links := getLinks(resp)
+
+	for _, link := range links {
+		if ok, _ := visited[link]; !ok {
+			//queue = append(queue, link)
+			//visited[link] = true
+			setVisited(link)
+			go visitPageT(link)
+		}
+	}
+}
+
+func main() {
+
+	username := os.Args[1]
+	password := os.Args[2]
+
+	csrfToken, sessionCookie = login(username, password)
+
+	// starting point
+	//queue = append(queue, "/fakebook/")
+
+	for i := 0; i < numThreads; i++ {
+		semaphore <- true
+	}
+
+	visitPageT("/fakebook/")
+
+	for len(flags) < 5 {
+		time.Sleep(1000)
+	}
 }
