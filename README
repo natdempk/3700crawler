@@ -6,14 +6,20 @@ Nathaniel Dempkowski and Sean Andrews, Team project4
 High-level Approach
 ===================
 
+Our program first makes a GET request to the login page, pulling out the CSRF token and sessionId that we need to correctly login. We get both of these via a regular expression. We post these back, and store the authenticated sessionId.
 
+Once we have that, we simply spin off a goroutine to visit the initial Fakebook page, /fakebook/. This goroutine makes a GET request to the requested page and receives a response. It parses out the response code using a regex. We follow 301 redirects and retry 500 errors. We don't handle any other errors or redirects, as they were outside of the scope of the assignment and 403, and 404 errors don't require any special behavior on our part (we implicity abandon them).
+
+Next we check the response for a flag using another regex. If we found a flag we print it and mark that we found it so we know when to quit. We then look through every link on the page and mark it so we won't visit it more than once. We then spin off a goroutine to visit that page. We manage the number of concurrent goroutines using a semaphore so that we don't overload the server or negatively impact performance. We didn't bother to implement keep-alive or anything fancy because asynchronous requests already find the flag pretty fast and our code is simple.
+
+Once we have all of the flags, our main routine quits.
 
 Challenges Faced
 ================
 
-
+The most difficulty we had was getting the initial network connections setup and successfully logging into our Fakebook account. We had to go through almost all of the headers and read the HTTP specs to see exactly what was required of us to login. Additionally we had some performance issues trying to use a Scanner to read back responses from the server that were hard to track down and were making our program take 5 seconds per request. Once we solved these it was smooth sailing. We also transitioned our program from a synchronous to an asynchronous model, but thanks to goroutines this was very straightforward. All we had to do was add a Mutex and a Semaphore and recursively spin off goroutines.
 
 Testing
 =======
 
-
+We first used some utilities like the Chrome Network Inspector and curl to generate minimal sample requests so that we knew what was required to successfully login. Once we had successful GET and POST requests, not much more testing was required. From there we were able to get away with print debugging and reasoning about our program, as it is relatively straightforward. We ran our program against the Fakebook server and successfully got all of the flags across multiple runs.
