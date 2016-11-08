@@ -11,48 +11,49 @@ import (
 	"time"
 )
 
-// One post is actually made
-// So only specify
-
-// Request type, http version, user-agent, host, accept etc
-// cookies
-
-// handle errors/redirects 301 (follow), 200, 403, 404, (abandon) 500 (retry)
-
-// globals
-
+// csrfToken is the token cookie/url param used for authentication
 var csrfToken string
+
+// sessionCookie is the cookie returned on successful login used for authentication
 var sessionCookie string
 
-var visited map[string]bool = make(map[string]bool)
-var queue []string
+// visited is a map of URLs we have already visited
+var visited = make(map[string]bool)
 
+// visitedMutex mutex so we can safely update our URLs we have visited
 var visitedMutex = &sync.Mutex{}
 
+// numThreads specifies number of requests to allow at a single time, so we don't overload the server
 const numThreads = 20
 
+// sempahore allows us to manage number of concurrent requests
 var semaphore = make(chan bool, numThreads)
+
+// flags is a channel to put flags we've found in, so we can determine when we're done
 var flags = make(chan string, 5)
 
-func setVisited(i string) {
+// safely record that we've visited a URL
+func setVisited(s string) {
 	visitedMutex.Lock()
-	visited[i] = true
+	visited[s] = true
 	visitedMutex.Unlock()
 	return
-
 }
 
+// create a new connection to the fakebook server
 func getConn() (conn net.Conn) {
 	conn, _ = net.Dial("tcp", "fring.ccs.neu.edu:80")
 	return
 }
 
+// parse the response code of the HTTP response header
 func responseCode(response string) (code int) {
 	stringCode := regexp.MustCompile("HTTP/1.1 ([0-9][0-9][0-9])")
 	code, _ = strconv.Atoi(stringCode.FindStringSubmatch(response)[1])
 	return
 }
 
+// make a GET request to a given path on fakebook
 func get(path string) (response string) {
 	conn := getConn()
 
@@ -76,6 +77,7 @@ Accept: */*
 	return
 }
 
+// login to Fakebook and get our csrf token and session id values
 func login(username, password string) (csrf, session string) {
 	resp := get("/accounts/login/?next=/fakebook")
 
@@ -117,6 +119,7 @@ username=%s&password=%s&csrfmiddlewaretoken=%s&next=%%2Ffakebook%%2F
 	return
 }
 
+// get every HTML link out of an HTTP response
 func getLinks(response string) (links []string) {
 	linkRegex := regexp.MustCompile(`<a href="(.*?)">`)
 	matches := linkRegex.FindAllStringSubmatch(response, -1)
@@ -128,29 +131,31 @@ func getLinks(response string) (links []string) {
 	return
 }
 
+// goroutine to visit a page and recursively spin off more goroutines to visit unvisited links
 func visitPageT(url string) {
-	_ = <-semaphore // beautiful
-	defer func() { semaphore <- true }()
-	//fmt.Printf("Visiting: %s\n", url)
+	_ = <-semaphore                      // grab one of the semaphore keys
+	defer func() { semaphore <- true }() // make sure we put it back when done
+	// get page and response code
 	resp := get(url)
 	rc := responseCode(resp)
 
+	// handle 301 redirects and 500 (retries)
 	switch rc {
-	case 301:
+	case 301: // follow redirect
 		locationRegex := regexp.MustCompile(`Location: (.*)`)
 		location := locationRegex.FindStringSubmatch(resp)[1]
-		//queue = append(queue, location)
+
 		go visitPageT(location)
 		return
-	case 500:
+	case 500: // retry current URL
 		go visitPageT(url)
 		return
 	}
 
+	// check for a flag in the page body, print it and put in the flag channel if found
 	flagRegex := regexp.MustCompile(`<h[1-6] class='secret_flag' style="color:red">FLAG: (.{64})</h[1-6]>`)
 	maybeFlag := flagRegex.FindAllStringSubmatch(resp, -1)
 	if len(maybeFlag) != 0 {
-		//fmt.Println("FOUND FLAG")
 		flag := maybeFlag[0][1]
 		flags <- flag
 		fmt.Println(flag)
@@ -158,10 +163,9 @@ func visitPageT(url string) {
 
 	links := getLinks(resp)
 
+	// visit all links on the page we haven't already visited
 	for _, link := range links {
 		if ok, _ := visited[link]; !ok {
-			//queue = append(queue, link)
-			//visited[link] = true
 			setVisited(link)
 			go visitPageT(link)
 		}
@@ -169,21 +173,21 @@ func visitPageT(url string) {
 }
 
 func main() {
-
 	username := os.Args[1]
 	password := os.Args[2]
 
+	// login
 	csrfToken, sessionCookie = login(username, password)
 
-	// starting point
-	//queue = append(queue, "/fakebook/")
-
+	// initialize semaphore keys
 	for i := 0; i < numThreads; i++ {
 		semaphore <- true
 	}
 
+	// visit starting page and recursively visit unvisited links
 	visitPageT("/fakebook/")
 
+	// keep running until we have all 5 flags
 	for len(flags) < 5 {
 		time.Sleep(1000)
 	}
